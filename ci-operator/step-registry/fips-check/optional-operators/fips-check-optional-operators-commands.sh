@@ -1,58 +1,81 @@
 #!/bin/bash
-# prerequest: Build check-payload
-#git clone https://gitlab.cee.redhat.com/rphillip/check-payload.git
-#cd check-payload
-#make
+set -e
+set -u
+set -o pipefail
+
+function set_proxy () {
+    if test -s "${SHARED_DIR}/proxy-conf.sh" ; then
+        echo "setting the proxy"
+        # cat "${SHARED_DIR}/proxy-conf.sh"
+        echo "source ${SHARED_DIR}/proxy-conf.sh"
+        source "${SHARED_DIR}/proxy-conf.sh"
+    else
+        echo "no proxy setting."
+    fi
+}
+function set_docker_config () {
+    if test -s "~/.docker/config.json" ; then
+        echo "setting the proxy"
+        cp ~/.docker/config.json ~/.docker/config.json.backup
+        cp /tmp/.dockerconfigjson ~/.docker/config.json
+    else
+        if [ ! -d "~/.docker/" ]; then
+            cp /tmp/.dockerconfigjson ~/.docker/config.json
+            chmod 644 ~/.docker/config.json
+        fi
+    fi
+}
+function run_command() {
+    local CMD="$1"
+    echo "Running Command: ${CMD}"
+    eval "${CMD}"
+}
+
+set_proxy
+run_command "oc extract secret/pull-secret -n openshift-config --confirm --to /tmp"; ret=$?
+if [[ $ret -eq 0 ]]; then
+    auths=`cat /tmp/.dockerconfigjson`
+    if [[ $auths =~ "5000" ]]; then
+        echo "This is a disconnected env, skip it."
+        exit 0
+    fi
+fi
 
 start_time=`date +"%Y-%m-%d %H:%M:%S"`
-data_dir=`pwd`
-catalog_image=$1
-operator_packages=$2
-#catalog_image="brew.registry.redhat.io/rh-osbs/iib-pub-pending:v4.10"
-#catalog_image="registry.redhat.io/redhat/redhat-operator-index:v4.10"
-catalog_type="internal"  #when catalog_type=internal, the registry.redhat.io will be replaced to brew.registry.redhat.io
-operator_catalog_file="${data_dir}/catalog.json"
-operator_select_file="${data_dir}/selected_operators"
-
-if [[ $catalog_image == "" ]]; then
-	echo "Please input the index image. For example, quay.io/openshift-qe-optional-operators/aosqe-index:v4.11"
-	exit 1
+data_dir=`/tmp/optional-operators/`
+package_list="/$data_dir/optional-operators-package-list-$RANDOM"
+operator_catalog_file="/$data_dir/opertional-operators-catalog-files"
+payload_version=`oc get clusterversion version -o=jsonpath='{.status.history[?(@.state == "Completed")].version}'`
+if [[ $payload_version == "" ]]; then
+	  echo "failed to get payload version"
+	  exit 1
 fi
-
-if [[ $operator_packages != "" ]]; then
-	rm -f ${operator_select_file}
-	for i in ${@: 2:$#}; do
-		echo $i >> ${operator_select_file}
-	done
-else
-	echo "Warning! No operator package specific, scanning all operators in the ${catalog_image}"
-	opm alpha list packages ${catalog_image} | awk 'NR>=2 {print $1}' >${operator_select_file}
-fi
-
+version=${payload_version:0:4}
+catalog_image="quay.io/openshift-qe-optional-operators/aosqe-index:v"+$verion
+mkdir $data_dir
+set_docker_config
+opm alpha list packages ${catalog_image} | awk 'NR>=2 {print $1}' >/${package_list}
 echo "The following operator will be scaned in ${catalog_image}"
-cat ${data_dir}/selected_operators
-
+cat ${package_list}
 opm render ${catalog_image} -o json >${operator_catalog_file}
 
 #Scan image per operator(package), the latest csv in each channel will be scaned
-for package in $(cat ${operator_select_file}); do
-    mkdir $data_dir/${package} || true
-    rm -rf $data_dir/${package}/*
+for package in $(cat /tmp/${package_list}); do
+    mkdir -p ${data_dir}/${package} || true
+    rm -rf /${data_dir}/${package}/*
     image_list="$data_dir/${package}/image_list.txt"
     #loop each channel
     for channel in $(jq -r 'select(.schema=="olm.channel" and .package=="'$package'")|.name' $operator_catalog_file|sort -V|uniq); do
 	# get the latest bundle name of channel
-	bundle_name=$(jq -r 'select(.schema=="olm.channel" and .package=="'$package'" and .name=="'$channel'")|.entries[].name' $operator_catalog_file|sort -rV|awk 'NR==1')
+	  bundle_name=$(jq -r 'select(.schema=="olm.channel" and .package=="'$package'" and .name=="'$channel'")|.entries[].name' $operator_catalog_file|sort -rV|awk 'NR==1')
         scan_result_bundle_file="$data_dir/${package}/${bundle_name}.result"
         for image_name in $(jq -r 'select(.schema=="olm.bundle" and .name=="'$bundle_name'")|.relatedImages[].name' $operator_catalog_file); do
             image_url=$(jq -r 'select(.schema=="olm.bundle" and .name=="'$bundle_name'")|.relatedImages[]|select(.name=="'$image_name'")|.image' $operator_catalog_file)
-            if [ $catalog_type == "internal" ]; then
-               image_url=${image_url//registry.redhat.io/brew.registry.redhat.io}
-	       image_url=${image_url//registry.stage.redhat.io/brew.registry.redhat.io}
-            fi
+            image_url=${image_url//registry.redhat.io/brew.registry.redhat.io}
+	          image_url=${image_url//registry.stage.redhat.io/brew.registry.redhat.io}
             echo "## scan $image_name ->  $image_url" |tee -a $scan_result_bundle_file
             echo "$image_url">>$image_list
-            nohup sudo ./check-payload scan operator --spec $image_url |& tee -a $scan_result_bundle_file
+            ./check-payload scan operator --spec $image_url |& tee -a $scan_result_bundle_file
         done
      done
      #delete images to save disk space
@@ -76,9 +99,9 @@ echo "===========================cost $hours hours $minutes mins $seconds s=====
 mkdir -p "${ARTIFACT_DIR}/junit"
 if $pass; then
     echo "All tests pass!"
-    cat >"${ARTIFACT_DIR}/junit/fips-check-node-scan.xml" <<EOF
+    cat >"${ARTIFACT_DIR}/junit/fips-check-optional-operators.xml" <<EOF
     <testsuite name="fips scan" tests="1" failures="0">
-        <testcase name="fips-check-node-scan"/>
+        <testcase name="fips-check-optional-operators"/>
         <succeed message="">Test pass, check the details from below</succeed>
         <system-out>
           $out
@@ -87,9 +110,9 @@ if $pass; then
 EOF
 else
     echo "Test fail, please check log."
-    cat >"${ARTIFACT_DIR}/junit/fips-check-node-scan.xml" <<EOF
+    cat >"${ARTIFACT_DIR}/junit/fips-check-optional-operators.xml" <<EOF
     <testsuite name="fips scan" tests="1" failures="1">
-      <testcase name="fips-check-node-scan">
+      <testcase name="fips-check-optional-operators">
         <failure message="">Test fail, check the details from below</failure>
         <system-out>
           $out
