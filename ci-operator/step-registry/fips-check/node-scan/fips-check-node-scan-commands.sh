@@ -76,7 +76,7 @@ oc --request-timeout=300s -n "$project" debug node/"$master_node_0" -- chroot /h
 out=$(oc --request-timeout=300s -n "$project" debug node/"$master_node_0" -- chroot /host bash -c "cat /$report" || true)
 echo "The report is: $out"
 oc delete ns $project || true
-res=$(echo $out | grep -E 'Failure Report|Successful run with warnings|Warning Report')
+res=$(echo $out | grep -E 'Failure Report|Successful run with warnings|Warning Report' || true)
 if [[ -n $res ]];then
     echo "The result is: $res"
     pass=false
